@@ -26,7 +26,7 @@ import {
 import './App.css';
 
 // Replace with your actual Perplexity API key
-const PERPLEXITY_API_KEY = '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';
+const PERPLEXITY_API_KEY = '';
 
 // API configuration
 const API_BASE_URL = 'https://newslines-backend-fbccce3b78b9.herokuapp.com/api';
