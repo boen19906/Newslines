@@ -563,175 +563,127 @@ const SummaryModal: React.FC<{
   };
 
   const generateChatResponse = async (userMessage: string) => {
-    if (!headline) return;
-
+    // Early validation
+    if (!headline) {
+      console.error('No headline available');
+      return;
+    }
+  
+    if (!userMessage.trim()) {
+      console.error('Empty user message');
+      return;
+    }
+  
     const newUserMessage: ChatMessage = {
       id: Date.now().toString(),
       role: 'user',
-      content: userMessage,
+      content: userMessage.trim(),
       timestamp: new Date()
     };
-
-    // Create initial assistant message for streaming
+  
     const assistantMessageId = (Date.now() + 1).toString();
-    const initialAssistantMessage: ChatMessage = {
-      id: assistantMessageId,
-      role: 'assistant',
-      // Add a typing indicator to the initial message
-      content: '...',
-      timestamp: new Date(),
-      sources: []
-    };
-
-    const updatedMessages = [...chatState.messages, newUserMessage, initialAssistantMessage];
+    // Only add user message initially, don't create empty assistant message
+    const updatedMessages = [...chatState.messages, newUserMessage];
     setChatState({
       messages: updatedMessages,
-      isLoading: false // Set to false since we're streaming into the assistant message
+      isLoading: true
     });
-
+  
     try {
-      // Build conversation context for Perplexity
+      // Build conversation context
+      const systemPrompt = `You are a helpful research assistant discussing: "${headline.title}"
+  
+  Context: ${headline.summary || 'No summary available.'}
+  
+  Guidelines:
+  - Keep responses under 80 words and conversational
+  - Use **bold** for key information
+  - Use *italics* for emphasis  
+  - Be direct and concise
+  - No citation numbers in your response`;
+  
       const conversationMessages = [
-        {
-          role: 'system',
-          content: `You are a helpful research assistant discussing the news story: "${headline.title}". 
-          
-          Original summary context: ${headline.summary || 'No summary available yet.'}
-          
-          Provide helpful, accurate responses about this story and related topics. Keep responses concise (under 150 words) and conversational. Cite sources when available. Do not include reasoning or thinking process in your response. Use **bold** for important names, figures, and key information. Use *italics* for emphasis.`
-        },
-        // Include previous conversation context (exclude the empty assistant message we just added)
+        { role: 'system', content: systemPrompt },
+        // Include last 6 messages for context (excluding the empty assistant message)
         ...chatState.messages.slice(-6).map(msg => ({
           role: msg.role,
           content: msg.content
         })),
-        {
-          role: 'user',
-          content: userMessage
-        }
+        { role: 'user', content: userMessage }
       ];
-
-      const requestBody = {
-        model: 'sonar',
-        messages: conversationMessages,
-        max_tokens: 200,
-        temperature: 0.3,
-        return_citations: true,
-        stream: true
-      };
-
+  
+      console.log('Sending request to Perplexity API...');
+  
       const response = await fetch('https://api.perplexity.ai/chat/completions', {
         method: 'POST',
         headers: {
           'Authorization': `Bearer ${PERPLEXITY_API_KEY}`,
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify(requestBody)
+        body: JSON.stringify({
+          model: 'sonar',
+          messages: conversationMessages,
+          max_tokens: 150,
+          temperature: 0.3,
+          return_citations: true,
+          stream: false
+        })
       });
-
+  
       if (!response.ok) {
-        throw new Error(`API error: ${response.status}`);
+        const errorText = await response.text();
+        console.error('API Error:', response.status, errorText);
+        throw new Error(`API request failed: ${response.status}`);
       }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No reader available');
+  
+      // Handle non-streaming response
+      const data = await response.json();
+      console.log('API Response:', data);
+  
+      const content = data.choices?.[0]?.message?.content || '';
+      const citations = data.citations || [];
+  
+      if (!content.trim()) {
+        throw new Error('No content received from API');
       }
-
-      let fullContent = '';
-      let citations: any[] = [];
-      const decoder = new TextDecoder();
-
-      // Process streaming response
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        const chunk = decoder.decode(value);
-        const lines = chunk.split('\n');
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6);
-            if (data === '[DONE]') continue;
-
-            try {
-              const parsed = JSON.parse(data);
-              
-              if (parsed.choices?.[0]?.delta?.content) {
-                const newContent = parsed.choices[0].delta.content;
-                fullContent += newContent;
-                
-                // Clean content in real-time
-                let cleanContent = fullContent
-                  .replace(/<think>[\s\S]*?<\/think>/gi, '')
-                  .replace(/^(Looking at|First,|Let me|I need to|Okay,)[\s\S]*?(?=\n\n|\n[A-Z]|$)/gm, '')
-                  .replace(/\n{3,}/g, '\n\n')
-                  .replace(/^\s+/gm, '')
-                  .trim();
-
-                // Update the assistant message with streaming content
-                setChatState(prevState => ({
-                  messages: prevState.messages.map(msg => 
-                    msg.id === assistantMessageId 
-                      ? { ...msg, content: cleanContent }
-                      : msg
-                  ),
-                  isLoading: false // Keep loading false during streaming
-                }));
-              }
-
-              // Capture citations when they arrive
-              if (parsed.citations) {
-                citations = parsed.citations;
-              }
-            } catch (e) {
-              // Ignore parsing errors for malformed chunks
-            }
-          }
-        }
-      }
-
-      // Final cleanup and add citations
-      let finalContent = fullContent
-        .replace(/<think>[\s\S]*?<\/think>/gi, '')
-        .replace(/^(Looking at|First,|Let me|I need to|Okay,)[\s\S]*?(?=\n\n|\n[A-Z]|$)/gm, '')
-        .replace(/\n{3,}/g, '\n\n')
-        .replace(/^\s+/gm, '')
-        .trim();
-
-      if (finalContent.length < 50 && fullContent.length > 0) {
-        finalContent = fullContent.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-      }
-
-      if (finalContent.length > 800) {
-        finalContent = finalContent.substring(0, 800) + '...';
-      }
-
-      // Final update with citations and set loading to false
-      setChatState(prevState => ({
-        messages: prevState.messages.map(msg => 
-          msg.id === assistantMessageId 
-            ? { ...msg, content: finalContent, sources: citations }
-            : msg
-        ),
+  
+      console.log('Raw content:', content);
+  
+      // Clean content
+      const finalContent = cleanContent(content);
+      console.log('Final content:', finalContent);
+  
+      // Create assistant message
+      const assistantMessage: ChatMessage = {
+        id: assistantMessageId,
+        role: 'assistant',
+        content: finalContent,
+        timestamp: new Date(),
+        sources: citations
+      };
+  
+      // Update state with final message
+      const finalMessages = [...updatedMessages, assistantMessage];
+      setChatState({
+        messages: finalMessages,
         isLoading: false
-      }));
-
-      // Save to sessionStorage
-      const finalMessages = updatedMessages.map(msg => 
-        msg.id === assistantMessageId 
-          ? { ...msg, content: finalContent, sources: citations }
-          : msg
-      );
+      });
+  
+      // Save to storage
       saveChatContext(finalMessages);
-
+      
+      console.log('Chat response completed successfully');
+  
     } catch (error) {
-      console.error('Chat error:', error);
+      console.error('Chat generation error:', error);
       
-      const errorMessage = 'Sorry, I encountered an error processing your question. Please try again.';
-      
+      // Show user-friendly error message
+      const errorMessage = error instanceof Error 
+        ? `Error: ${error.message}` 
+        : 'Something went wrong. Please try again.';
+  
       setChatState(prevState => ({
+        ...prevState,
         messages: prevState.messages.map(msg => 
           msg.id === assistantMessageId 
             ? { ...msg, content: errorMessage }
@@ -741,6 +693,26 @@ const SummaryModal: React.FC<{
       }));
     }
   };
+  
+  // Simplified content cleaning function
+  const cleanContent = (rawContent: string): string => {
+    if (!rawContent) return '';
+  
+    return rawContent
+      // Remove citation brackets [1], [2], etc.
+      .replace(/\[\d+\]/g, '')
+      // Remove citation ranges [1-3], [1,2,3]
+      .replace(/\[[\d\s,\-]+\]/g, '')
+      // Remove thinking tags
+      .replace(/<think>[\s\S]*?<\/think>/gi, '')
+      // Clean up multiple spaces
+      .replace(/\s{2,}/g, ' ')
+      // Clean up multiple newlines
+      .replace(/\n{3,}/g, '\n\n')
+      // Remove leading/trailing whitespace
+      .trim();
+  };
+  
 
   const handleChatSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1359,7 +1331,7 @@ const App: React.FC = () => {
       
       if (data.success && data.headlines) {
         setHeadlines(data.headlines);
-        setLastUpdated(new Date(data.timestamp).toLocaleTimeString());
+        setLastUpdated(new Date().toLocaleTimeString());
         
         if (data.warnings && data.warnings.length > 0) {
           setWarnings(data.warnings);
